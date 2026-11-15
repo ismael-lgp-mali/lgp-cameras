@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Caméra LGP</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: #0f1a14; color: #fff; min-height: 100vh;
+         display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; text-align: center; }
+  h1 { font-size: 30px; margin: 0 0 6px; }
+  .sous { color: #9fc4ad; margin: 0 0 24px; font-size: 16px; }
+  button { background: #2fbf63; color: #fff; border: 0; border-radius: 18px; font-size: 24px; font-weight: 700;
+           padding: 22px 40px; box-shadow: 0 6px 18px rgba(0,0,0,.35); }
+  video { width: 100%; max-width: 420px; border-radius: 16px; margin: 16px 0; background: #000; display: none; }
+  #etat { font-size: 20px; font-weight: 600; margin: 8px 0; }
+  #detail { color: #9fc4ad; font-size: 15px; line-height: 1.5; }
+  .ok { color: #5fe08c; } .alerte { color: #ff8a65; } .attente { color: #ffd166; }
+</style>
+</head>
+<body>
+<h1 id="nom">Caméra</h1>
+<p class="sous">Contrôle des vendeurs — La Grande Poussinière</p>
+<button id="demarrer">Démarrer la surveillance</button>
+<video id="video" playsinline muted></video>
+<div id="etat"></div>
+<div id="detail"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+const JETON = '9035578334:AAFLkTKO03R2RjwHm3j4KhRA9VikT-_CQCU';
+const API = 'https://api.telegram.org/bot' + JETON + '/';
+const p = new URLSearchParams(location.search);
+const NUMERO = p.get('c') || '1';
+const NOM = 'Caméra ' + NUMERO;
+const DEBUT = Number(p.get('debut') || 8);      // heure de début du travail
+const FIN = Number(p.get('fin') || 18);         // heure de fin (bilan envoyé à cette heure)
+const TOUTES_LES = 2 * 60 * 1000;               // contrôle toutes les 2 minutes
+const ABSENCE = 20 * 60 * 1000;                 // alerte après 20 minutes d'absence
+
+document.getElementById('nom').textContent = NOM;
+const video = document.getElementById('video');
+const etat = document.getElementById('etat');
+const detail = document.getElementById('detail');
+
+let modele, chatId = localStorage.getItem('lgp_chat') || null;
+let absentDepuis = null, derniereAlerteAbsence = 0, dernierId = 0, verrou = null;
+
+// ---------- Bilan du jour, gardé dans le téléphone ----------
+function jour() { const d = new Date(); return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate(); }
+function lireBilan() {
+  try { const b = JSON.parse(localStorage.getItem('lgp_bilan') || '{}'); if (b.jour === jour()) return b; } catch (e) {}
+  return { jour: jour(), telephone: 0, absence: 0, minutesAbsent: 0, envoye: false };
+}
+function garderBilan(b) { try { localStorage.setItem('lgp_bilan', JSON.stringify(b)); } catch (e) {} }
+function heure() { const d = new Date(); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); }
+function dateFr() { const d = new Date(); return String(d.getDate()).padStart(2, '0') + '/' + String(d.getMonth() + 1).padStart(2, '0') + '/' + d.getFullYear(); }
+
+// ---------- Telegram ----------
+async function trouverChat() {
+  while (!chatId) {
+    try {
+      const r = await (await fetch(API + 'getUpdates')).json();
+      const m = (r.result || []).map(u => u.message).filter(m => m && m.chat && m.chat.type === 'private');
+      if (m.length) { chatId = String(m[m.length - 1].chat.id); localStorage.setItem('lgp_chat', chatId); break; }
+    } catch (e) {}
+    etat.className = 'attente';
+    etat.textContent = 'Envoyez /start au robot Contrôle Vendeurs LGP dans Telegram';
+    await new Promise(r => setTimeout(r, 5000));
+  }
+}
+async function message(texte) {
+  try { await fetch(API + 'sendMessage', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text: texte }) }); } catch (e) {}
+}
+function photo() {
+  const c = document.createElement('canvas');
+  const l = Math.min(800, video.videoWidth || 640);
+  c.width = l; c.height = Math.round(l * (video.videoHeight || 480) / (video.videoWidth || 640));
+  c.getContext('2d').drawImage(video, 0, 0, c.width, c.height);
+  return new Promise(r => c.toBlob(r, 'image/jpeg', 0.75));
+}
+async function envoyerPhoto(legende) {
+  try {
+    const f = new FormData();
+    f.append('chat_id', chatId); f.append('caption', legende); f.append('photo', await photo(), 'photo.jpg');
+    await fetch(API + 'sendPhoto', { method: 'POST', body: f });
+  } catch (e) {}
+}
+function simple(t) { return (t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, '').toLowerCase(); }
+
+// Photo à la demande : écrire « camera 1 » (ou « tous ») au robot
+async function ecouter() {
+  try {
+    const r = await (await fetch(API + 'getUpdates' + (dernierId ? '?offset=' + (dernierId + 1) : ''))).json();
+    const liste = r.result || [];
+    const premier = dernierId === 0;
+    for (const u of liste) {
+      dernierId = Math.max(dernierId, u.update_id);
+      if (premier) continue; // les anciens messages ne comptent pas
+      const t = simple(u.message && u.message.text);
+      if (t === 'camera' + NUMERO || t === 'cam' + NUMERO || t === 'tous') {
+        await envoyerPhoto('📷 ' + NOM + ' — ' + heure());
+      }
+    }
+  } catch (e) {}
+  setTimeout(ecouter, 4000);
+}
+
+// ---------- Ce que voit la caméra ----------
+async function regarder() {
+  let personne = false, telephone = false;
+  for (let i = 0; i < 3; i++) {
+    const vus = await modele.detect(video, 20, 0.3);
+    if (vus.some(o => o.class === 'person' && o.score > 0.5)) personne = true;
+    if (vus.some(o => o.class === 'cell phone' && o.score > 0.35)) telephone = true;
+    await new Promise(r => setTimeout(r, 700));
+  }
+  return { personne, telephone };
+}
+
+async function controle() {
+  const h = new Date().getHours();
+  const b = lireBilan();
+  if (h >= FIN && !b.envoye) {
+    await message('📊 Bilan ' + NOM + ' du ' + dateFr() + '\n' +
+      '• Pas sur son téléphone : ' + b.telephone + ' fois\n' +
+      '• Absent plus de 20 min : ' + b.absence + ' fois\n' +
+      '• Temps absent au total : ' + b.minutesAbsent + ' min');
+    b.envoye = true; garderBilan(b);
+  }
+  if (h < DEBUT || h >= FIN) {
+    etat.className = 'attente'; etat.textContent = 'En veille (hors des heures de travail)';
+    absentDepuis = null; return;
+  }
+  const { personne, telephone } = await regarder();
+  const maintenant = Date.now();
+  if (!personne) {
+    if (!absentDepuis) absentDepuis = maintenant;
+    const duree = maintenant - absentDepuis;
+    b.minutesAbsent += 2; garderBilan(b);
+    if (duree >= ABSENCE && maintenant - derniereAlerteAbsence >= ABSENCE) {
+      derniereAlerteAbsence = maintenant; b.absence++; garderBilan(b);
+      await envoyerPhoto('🚨 ' + NOM + ' : place vide depuis ' + Math.round(duree / 60000) + ' min (' + heure() + ')');
+    }
+    etat.className = 'alerte'; etat.textContent = 'Place vide depuis ' + Math.round(duree / 60000) + ' min';
+  } else {
+    if (absentDepuis && derniereAlerteAbsence >= absentDepuis) {
+      await message('✅ ' + NOM + ' : de retour après ' + Math.round((maintenant - absentDepuis) / 60000) + ' min (' + heure() + ')');
+    }
+    absentDepuis = null;
+    if (!telephone) {
+      b.telephone++; garderBilan(b);
+      await envoyerPhoto('⚠️ ' + NOM + ' : pas sur son téléphone (' + heure() + ')');
+      etat.className = 'alerte'; etat.textContent = 'Vendeur présent, pas sur son téléphone';
+    } else {
+      etat.className = 'ok'; etat.textContent = 'Vendeur au travail sur son téléphone';
+    }
+  }
+  detail.textContent = 'Dernier contrôle : ' + heure() + ' — prochain dans 2 minutes';
+}
+
+// ---------- Écran toujours allumé ----------
+async function garderAllume() {
+  try { if ('wakeLock' in navigator) verrou = await navigator.wakeLock.request('screen'); } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') garderAllume(); });
+
+const bouton = document.getElementById('demarrer');
+bouton.style.display = 'none';
+const ouverteLe = Date.now();
+let lance = false;
+// Rechargement de nuit (3 h) : le téléphone repart propre chaque jour, sans personne
+setInterval(() => { if (new Date().getHours() === 3 && Date.now() - ouverteLe > 3600000) location.reload(); }, 600000);
+window.addEventListener('load', demarrer);
+bouton.onclick = demarrer;
+
+async function demarrer() {
+  if (lance) return;
+  lance = true;
+  bouton.style.display = 'none';
+  etat.className = 'attente'; etat.textContent = 'Démarrage…';
+  try {
+    video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: 1280 }, audio: false });
+    await video.play(); video.style.display = 'block';
+  } catch (e) {
+    etat.className = 'alerte'; etat.textContent = 'Caméra refusée : autorisez la caméra puis rechargez la page';
+    bouton.style.display = 'inline-block'; lance = false; return;
+  }
+  try { await document.documentElement.requestFullscreen(); } catch (e) {}
+  garderAllume();
+  etat.textContent = 'Chargement de la détection (1re fois : 1 à 2 minutes)…';
+  let m;
+  while (!m) {
+    try { m = await cocoSsd.load({ base: 'mobilenet_v2' }); }
+    catch (e) { etat.textContent = 'Pas d\'internet, nouvel essai dans 1 minute…'; await new Promise(r => setTimeout(r, 60000)); }
+  }
+  modele = m;
+  await trouverChat();
+  await message('✅ ' + NOM + ' en marche (' + heure() + ')');
+  ecouter();
+  await controle();
+  setInterval(controle, TOUTES_LES);
+}
+</script>
+</body>
+</html>
